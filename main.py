@@ -1,5 +1,8 @@
+import io
+import json
 import os
-import sqlite3
+import time
+import asyncio
 from datetime import datetime, timezone
 
 import discord
@@ -12,8 +15,8 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")  # optional: set for instant slash-command sync during testing
 JOIN_LOG_CHANNEL_ID = int(os.getenv("JOIN_LOG_CHANNEL_ID", "1522303537306927317"))
+DB_CHANNEL_ID = int(os.getenv("DB_CHANNEL_ID", "1521201722930757649"))
 FAKE_ACCOUNT_AGE_DAYS = int(os.getenv("FAKE_ACCOUNT_AGE_DAYS", "7"))
-DB_PATH = os.getenv("DB_PATH", "invites.db")
 
 intents = discord.Intents.default()
 intents.members = True  # required: enable "Server Members Intent" in the Discord Developer Portal
@@ -22,61 +25,76 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 # ---------------------------------------------------------------------------
-# Database
+# "Database": a JSON blob kept as a file attachment on one message in
+# DB_CHANNEL_ID. Discord stores it permanently, so it survives Railway
+# redeploys with no paid volume needed.
 # ---------------------------------------------------------------------------
 
-db = sqlite3.connect(DB_PATH)
-db.execute(
-    """
-    CREATE TABLE IF NOT EXISTS invite_stats (
-        guild_id INTEGER,
-        user_id INTEGER,
-        regular INTEGER DEFAULT 0,
-        left_count INTEGER DEFAULT 0,
-        fake INTEGER DEFAULT 0,
-        bonus INTEGER DEFAULT 0,
-        PRIMARY KEY (guild_id, user_id)
-    )
-    """
-)
-db.execute(
-    """
-    CREATE TABLE IF NOT EXISTS join_records (
-        guild_id INTEGER,
-        member_id INTEGER,
-        inviter_id INTEGER,
-        invite_code TEXT,
-        is_fake INTEGER,
-        is_vanity INTEGER,
-        joined_at TEXT,
-        PRIMARY KEY (guild_id, member_id)
-    )
-    """
-)
-db.commit()
+DB_FILENAME = "database.json"
+
+state = {
+    "stats": {},    # {guild_id: {user_id: {regular, left_count, fake, bonus}}}
+    "records": {},  # {guild_id: {member_id: {inviter_id, code, is_fake, is_vanity}}}
+}
+
+db_message: discord.Message | None = None
+save_lock = asyncio.Lock()
+
+
+async def load_state():
+    """Load the database file from the DB channel, if one already exists."""
+    global db_message, state
+
+    channel = bot.get_channel(DB_CHANNEL_ID)
+    if channel is None:
+        print(f"WARNING: could not find DB_CHANNEL_ID={DB_CHANNEL_ID}. Starting with empty data.")
+        return
+
+    async for message in channel.history(limit=50):
+        if message.author.id == bot.user.id:
+            for attachment in message.attachments:
+                if attachment.filename == DB_FILENAME:
+                    raw = await attachment.read()
+                    try:
+                        loaded = json.loads(raw.decode("utf-8"))
+                        loaded.setdefault("stats", {})
+                        loaded.setdefault("records", {})
+                        state = loaded
+                    except json.JSONDecodeError:
+                        print("WARNING: database.json was unreadable, starting fresh.")
+                    db_message = message
+                    print(f"Loaded database from message {message.id} in #{channel.name}.")
+                    return
+
+    print("No existing database found in the DB channel — starting fresh.")
+
+
+async def save_state():
+    """Persist the current state to the DB channel as a file attachment."""
+    global db_message
+
+    channel = bot.get_channel(DB_CHANNEL_ID)
+    if channel is None:
+        return
+
+    buffer = io.BytesIO(json.dumps(state, indent=2).encode("utf-8"))
+    file = discord.File(buffer, filename=DB_FILENAME)
+    content = f"\U0001f5c4\ufe0f Invite database — last updated <t:{int(time.time())}:f>"
+
+    async with save_lock:
+        if db_message is not None:
+            try:
+                db_message = await db_message.edit(content=content, attachments=[file])
+                return
+            except discord.NotFound:
+                db_message = None  # message was deleted, fall through to re-create it
+
+        db_message = await channel.send(content=content, file=file)
 
 
 def get_stats(guild_id: int, user_id: int):
-    row = db.execute(
-        "SELECT regular, left_count, fake, bonus FROM invite_stats WHERE guild_id=? AND user_id=?",
-        (guild_id, user_id),
-    ).fetchone()
-    if row is None:
-        return {"regular": 0, "left_count": 0, "fake": 0, "bonus": 0}
-    return {"regular": row[0], "left_count": row[1], "fake": row[2], "bonus": row[3]}
-
-
-def adjust_stat(guild_id: int, user_id: int, field: str, delta: int):
-    db.execute(
-        f"""
-        INSERT INTO invite_stats (guild_id, user_id, {field})
-        VALUES (?, ?, ?)
-        ON CONFLICT(guild_id, user_id)
-        DO UPDATE SET {field} = {field} + excluded.{field}
-        """,
-        (guild_id, user_id, delta),
-    )
-    db.commit()
+    guild_stats = state["stats"].setdefault(str(guild_id), {})
+    return guild_stats.setdefault(str(user_id), {"regular": 0, "left_count": 0, "fake": 0, "bonus": 0})
 
 
 def total_invites(guild_id: int, user_id: int) -> int:
@@ -84,35 +102,25 @@ def total_invites(guild_id: int, user_id: int) -> int:
     return max(s["regular"] - s["left_count"] + s["bonus"], 0)
 
 
-def save_join_record(guild_id, member_id, inviter_id, code, is_fake, is_vanity):
-    db.execute(
-        """
-        INSERT INTO join_records (guild_id, member_id, inviter_id, invite_code, is_fake, is_vanity, joined_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(guild_id, member_id) DO UPDATE SET
-            inviter_id=excluded.inviter_id,
-            invite_code=excluded.invite_code,
-            is_fake=excluded.is_fake,
-            is_vanity=excluded.is_vanity,
-            joined_at=excluded.joined_at
-        """,
-        (guild_id, member_id, inviter_id, code, int(is_fake), int(is_vanity), datetime.now(timezone.utc).isoformat()),
-    )
-    db.commit()
+def set_join_record(guild_id, member_id, inviter_id, code, is_fake, is_vanity):
+    guild_records = state["records"].setdefault(str(guild_id), {})
+    guild_records[str(member_id)] = {
+        "inviter_id": inviter_id,
+        "code": code,
+        "is_fake": is_fake,
+        "is_vanity": is_vanity,
+        "joined_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def pop_join_record(guild_id, member_id):
-    row = db.execute(
-        "SELECT inviter_id, is_fake, is_vanity FROM join_records WHERE guild_id=? AND member_id=?",
-        (guild_id, member_id),
-    ).fetchone()
-    db.execute("DELETE FROM join_records WHERE guild_id=? AND member_id=?", (guild_id, member_id))
-    db.commit()
-    return row
+    guild_records = state["records"].setdefault(str(guild_id), {})
+    return guild_records.pop(str(member_id), None)
 
 
 # ---------------------------------------------------------------------------
 # Invite cache: guild_id -> {code: uses}. "__vanity__" is a special key.
+# This is rebuilt live from Discord each session — it's not persisted.
 # ---------------------------------------------------------------------------
 
 invite_cache: dict[int, dict[str, int]] = {}
@@ -144,6 +152,8 @@ async def cache_guild_invites(guild: discord.Guild):
 
 @bot.event
 async def on_ready():
+    await load_state()
+
     for guild in bot.guilds:
         await cache_guild_invites(guild)
 
@@ -213,28 +223,30 @@ async def on_member_join(member: discord.Member):
     account_age_days = (datetime.now(timezone.utc) - member.created_at).days
     is_fake = inviter is not None and account_age_days < FAKE_ACCOUNT_AGE_DAYS
 
-    save_join_record(guild.id, member.id, inviter.id if inviter else None, code, is_fake, vanity_used)
-
-    log_channel = bot.get_channel(JOIN_LOG_CHANNEL_ID)
-    if log_channel is None:
-        return
+    set_join_record(guild.id, member.id, inviter.id if inviter else None, code, is_fake, vanity_used)
 
     if vanity_used:
         msg = f"{member.mention} joined using a vanity invite."
     elif inviter and is_fake:
-        adjust_stat(guild.id, inviter.id, "fake", 1)
+        stats = get_stats(guild.id, inviter.id)
+        stats["fake"] += 1
         msg = (
             f"{member.mention} has been invited by {inviter.mention}, "
             f"but this invite is **fake** (account created {account_age_days} day(s) ago)."
         )
     elif inviter:
-        adjust_stat(guild.id, inviter.id, "regular", 1)
+        stats = get_stats(guild.id, inviter.id)
+        stats["regular"] += 1
         total = total_invites(guild.id, inviter.id)
         msg = f"{member.mention} has been invited by {inviter.mention} and has now {total} invites."
     else:
         msg = f"{member.mention} joined, but I couldn't determine which invite was used."
 
-    await log_channel.send(msg)
+    await save_state()
+
+    log_channel = bot.get_channel(JOIN_LOG_CHANNEL_ID)
+    if log_channel is not None:
+        await log_channel.send(msg)
 
 
 @bot.event
@@ -242,9 +254,13 @@ async def on_member_remove(member: discord.Member):
     record = pop_join_record(member.guild.id, member.id)
     if record is None:
         return
-    inviter_id, is_fake, is_vanity = record
-    if inviter_id and not is_fake and not is_vanity:
-        adjust_stat(member.guild.id, inviter_id, "left_count", 1)
+
+    inviter_id = record["inviter_id"]
+    if inviter_id and not record["is_fake"] and not record["is_vanity"]:
+        stats = get_stats(member.guild.id, inviter_id)
+        stats["left_count"] += 1
+
+    await save_state()
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +287,6 @@ async def invites_cmd(interaction: discord.Interaction, member: discord.Member =
     embed.set_thumbnail(url=target.display_avatar.url)
 
     await interaction.response.send_message(embed=embed)
-
 
 
 if __name__ == "__main__":
