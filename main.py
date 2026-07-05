@@ -3,7 +3,7 @@ import json
 import os
 import time
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
@@ -136,9 +136,18 @@ def pop_join_record(guild_id, member_id):
 # ---------------------------------------------------------------------------
 
 
-def current_week_key() -> str:
-    year, week, _ = datetime.now(timezone.utc).isocalendar()
-    return f"{year}-W{week:02d}"
+def current_period_start() -> datetime:
+    """Most recent Sunday 23:00 UTC at or before now — the start of the current period."""
+    now = datetime.now(timezone.utc)
+    days_since_sunday = (now.weekday() - 6) % 7  # Monday=0 ... Sunday=6
+    candidate = (now - timedelta(days=days_since_sunday)).replace(hour=23, minute=0, second=0, microsecond=0)
+    if candidate > now:
+        candidate -= timedelta(days=7)
+    return candidate
+
+
+def next_reset_time() -> datetime:
+    return current_period_start() + timedelta(days=7)
 
 
 def get_message_stats(guild_id: int, user_id: int):
@@ -154,18 +163,18 @@ def record_message(guild_id: int, user_id: int):
 
 
 async def reset_weekly_if_needed():
-    week_key = current_week_key()
-    if messages_db.data.get("week_key") == week_key:
+    period_key = current_period_start().isoformat()
+    if messages_db.data.get("week_key") == period_key:
         return
 
     for guild_users in messages_db.data["users"].values():
         for stats in guild_users.values():
             stats["weekly"] = 0
 
-    messages_db.data["week_key"] = week_key
+    messages_db.data["week_key"] = period_key
     messages_db.dirty = True
     await messages_db.save(force=True)
-    print(f"Weekly message counts reset for week {week_key}.")
+    print(f"Weekly message counts reset for period starting {period_key}.")
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +397,33 @@ async def messages_cmd(interaction: discord.Interaction, member: discord.Member 
         color=discord.Color.green(),
     )
     embed.set_thumbnail(url=target.display_avatar.url)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="messageleaderboard", description="Show the top 10 most active members this week")
+async def message_leaderboard_cmd(interaction: discord.Interaction):
+    guild_users = messages_db.data["users"].get(str(interaction.guild.id), {})
+
+    ranked = sorted(guild_users.items(), key=lambda item: item[1]["weekly"], reverse=True)
+    ranked = [(uid, stats) for uid, stats in ranked if stats["weekly"] > 0][:10]
+
+    if not ranked:
+        description = "No messages have been tracked yet this week."
+    else:
+        lines = []
+        for i, (user_id, stats) in enumerate(ranked, start=1):
+            member = interaction.guild.get_member(int(user_id))
+            mention = member.mention if member else f"<@{user_id}>"
+            lines.append(f"{i}. {mention} — `{stats['weekly']}` msgs")
+        description = "The top 10 most active members this week:\n\n" + "\n".join(lines)
+
+    embed = discord.Embed(
+        title="Weekly Message Leaderboard",
+        description=description,
+        color=discord.Color.green(),
+    )
+    embed.set_footer(text="Resets every Sunday at 23:00 UTC")
 
     await interaction.response.send_message(embed=embed)
 
