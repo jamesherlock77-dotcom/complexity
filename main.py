@@ -415,7 +415,7 @@ async def message_leaderboard_cmd(interaction: discord.Interaction):
         for i, (user_id, stats) in enumerate(ranked, start=1):
             member = interaction.guild.get_member(int(user_id))
             mention = member.mention if member else f"<@{user_id}>"
-            lines.append(f"{i}. {mention} — `{stats['weekly']}` msgs")
+            lines.append(f"**{i}.** {mention} — `{stats['weekly']}` msgs")
         description = "The top 10 most active members this week:\n\n" + "\n".join(lines)
 
     embed = discord.Embed(
