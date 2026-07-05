@@ -12,7 +12,6 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")  # optional: set for instant slash-command sync during testing
 JOIN_LOG_CHANNEL_ID = int(os.getenv("JOIN_LOG_CHANNEL_ID", "1522303537306927317"))
-INVITES_CHANNEL_ID = int(os.getenv("INVITES_CHANNEL_ID", "1521201722930757649"))
 FAKE_ACCOUNT_AGE_DAYS = int(os.getenv("FAKE_ACCOUNT_AGE_DAYS", "7"))
 DB_PATH = os.getenv("DB_PATH", "invites.db")
 
@@ -260,19 +259,19 @@ async def invites_cmd(interaction: discord.Interaction, member: discord.Member =
     stats = get_stats(interaction.guild.id, target.id)
     total = total_invites(interaction.guild.id, target.id)
 
-    text = (
-        f"**{target.display_name}**\n\n"
-        f"You currently have **{total}** invites. "
-        f"({stats['regular']} regular, {stats['left_count']} left, {stats['fake']} fake, {stats['bonus']} bonus)"
+    embed = discord.Embed(
+        title=target.display_name,
+        description=(
+            f"You currently have **{total}** invites. "
+            f"({stats['regular']} regular, {stats['left_count']} left, "
+            f"{stats['fake']} fake, {stats['bonus']} bonus)"
+        ),
+        color=discord.Color.blurple(),
     )
+    embed.set_thumbnail(url=target.display_avatar.url)
 
-    out_channel = bot.get_channel(INVITES_CHANNEL_ID)
+    await interaction.response.send_message(embed=embed)
 
-    if out_channel and interaction.channel_id != INVITES_CHANNEL_ID:
-        await out_channel.send(text)
-        await interaction.response.send_message(f"📊 Sent to {out_channel.mention}", ephemeral=True)
-    else:
-        await interaction.response.send_message(text)
 
 
 if __name__ == "__main__":
